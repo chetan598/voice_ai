@@ -205,6 +205,233 @@ wss.on("connection", (ws, req) => {
   let keepAliveInterval = null;
   let geminiKeepAliveInterval = null;
 
+  // Handle tool calls - MUST be defined before initializeGeminiSession
+  const handleToolCall = async (fc, session) => {
+    console.log(`\n\n🚨🚨🚨 NEW DETAILED LOGGING VERSION - handleToolCall EXECUTED 🚨🚨🚨\n`);
+    console.log(`\n🔧 ========== TOOL CALL START ==========`);
+    console.log(`🔧 Tool name: ${fc.name}`);
+    console.log(`🔧 Tool ID: ${fc.id}`);
+    console.log(`🔧 Tool arguments:`, JSON.stringify(fc.args, null, 2));
+
+    if (!agentConfig?.tools || agentConfig.tools.length === 0) {
+      console.error('❌ No tools configured in agent');
+      session?.sendToolResponse({
+        functionResponses: [
+          {
+            id: fc.id,
+            name: fc.name,
+            response: { result: JSON.stringify({ error: "No tools configured" }) },
+          },
+        ],
+      });
+      console.log(`🔧 ========== TOOL CALL END (NO TOOLS) ==========\n`);
+      return;
+    }
+
+    const tool = agentConfig.tools.find((t) => t.tool_name === fc.name);
+    if (!tool) {
+      console.error('❌ Tool not found:', fc.name);
+      console.error('📋 Available tools:', agentConfig.tools.map(t => t.tool_name));
+      session?.sendToolResponse({
+        functionResponses: [
+          {
+            id: fc.id,
+            name: fc.name,
+            response: { result: JSON.stringify({ error: "Tool not found" }) },
+          },
+        ],
+      });
+      console.log(`🔧 ========== TOOL CALL END (NOT FOUND) ==========\n`);
+      return;
+    }
+
+    console.log(`✅ Tool found in config:`, {
+      name: tool.tool_name,
+      endpoint: tool.endpoint_url,
+      method: tool.http_method,
+      hasPayloadTemplate: !!tool.payload_body,
+      hasCustomHeaders: !!tool.headers,
+    });
+
+    try {
+      // Prepare headers
+      const headers = { "Content-Type": "application/json", ...tool.headers };
+      
+      // Map Gemini arguments to API parameters
+      let body;
+      if (tool.payload_body && tool.http_method !== "GET") {
+        console.log('📦 Original payload template:', tool.payload_body);
+        
+        try {
+          const payloadTemplate = JSON.parse(tool.payload_body);
+          const providedArgs = fc.args || {};
+          
+          console.log('📦 PAYLOAD COMPARISON:');
+          console.log('   ========== SCHEMA STRUCTURE ==========');
+          if (payloadTemplate.properties) {
+            console.log('   Expected top-level parameters:', Object.keys(payloadTemplate.properties));
+            console.log('   Required parameters:', payloadTemplate.required || 'none specified');
+          }
+          console.log('   Full schema:', JSON.stringify(payloadTemplate, null, 2));
+          console.log('\n   ========== GEMINI PROVIDED ==========');
+          console.log('   Args from Gemini:', JSON.stringify(providedArgs, null, 2));
+          console.log('   Number of parameters provided:', Object.keys(providedArgs).length);
+          
+          // Extract expected parameter names from the schema
+          let requestBody = {};
+          if (payloadTemplate && payloadTemplate.properties) {
+            const expectedParams = Object.keys(payloadTemplate.properties);
+            
+            console.log('\n   ========== MAPPING PROCESS ==========');
+            
+            // Try to match arguments (handle name variations)
+            for (const expectedParam of expectedParams) {
+              // Direct match
+              if (providedArgs[expectedParam] !== undefined) {
+                requestBody[expectedParam] = providedArgs[expectedParam];
+                console.log(`   ✅ Mapped: ${expectedParam} = ${JSON.stringify(providedArgs[expectedParam])}`);
+              } else {
+                // Try common variations (item_id -> item_ref, etc.)
+                const argKeys = Object.keys(providedArgs);
+                const matchingKey = argKeys.find(key => {
+                  const keyBase = key.split('_')[0].toLowerCase();
+                  const paramBase = expectedParam.split('_')[0].toLowerCase();
+                  return keyBase === paramBase || 
+                         key.toLowerCase().includes(paramBase) ||
+                         expectedParam.toLowerCase().includes(keyBase);
+                });
+                
+                if (matchingKey) {
+                  requestBody[expectedParam] = providedArgs[matchingKey];
+                  console.log(`   ✅ Mapped (variant): ${expectedParam} = ${JSON.stringify(providedArgs[matchingKey])} (from ${matchingKey})`);
+                } else {
+                  console.log(`   ⚠️  No match found for parameter: ${expectedParam}`);
+                }
+              }
+            }
+            
+            // If no mapping worked, just pass through all arguments
+            if (Object.keys(requestBody).length === 0) {
+              console.log('   ⚠️  No parameters mapped, using all arguments as-is');
+              requestBody = providedArgs;
+            }
+            
+            // Wrap in args object as expected by the API
+            body = { args: requestBody };
+            console.log('\n   ========== FINAL API PAYLOAD ==========');
+            console.log('   Sending to API:', JSON.stringify(body, null, 2));
+            console.log('   Parameters mapped:', Object.keys(requestBody).length, '/', expectedParams.length);
+          } else {
+            // No properties in schema, wrap arguments in args object
+            console.log('   No schema properties found, wrapping arguments in args object');
+            body = { args: fc.args || {} };
+          }
+        } catch (parseError) {
+          console.error('   ❌ Failed to parse payload template as JSON:', parseError.message);
+          console.log('   Falling back to raw arguments wrapped in args object');
+          body = { args: fc.args || {} };
+        }
+      } else {
+        body = { args: fc.args || {} };
+      }
+
+      // Make the API call
+      const fetchOptions = {
+        method: tool.http_method,
+        headers,
+      };
+      
+      if (tool.http_method !== "GET" && body) {
+        fetchOptions.body = JSON.stringify(body);
+      }
+      
+      console.log(`\n📤 ========== HTTP REQUEST ==========`);
+      console.log(`   URL: ${tool.endpoint_url}`);
+      console.log(`   Method: ${tool.http_method}`);
+      console.log(`   Headers:`, JSON.stringify(headers, null, 2));
+      if (fetchOptions.body) {
+        console.log(`   Body:`, fetchOptions.body.substring(0, 1000)); // First 1000 chars
+      }
+      console.log(`📤 ====================================\n`);
+      
+      const requestStartTime = Date.now();
+      const toolResponse = await fetch(tool.endpoint_url, fetchOptions);
+      const requestDuration = Date.now() - requestStartTime;
+      
+      console.log(`\n📥 ========== HTTP RESPONSE (${requestDuration}ms) ==========`);
+      console.log(`   Status: ${toolResponse.status} ${toolResponse.statusText}`);
+      console.log(`   OK: ${toolResponse.ok}`);
+      console.log(`   Headers:`, JSON.stringify(Object.fromEntries(toolResponse.headers.entries()), null, 2));
+
+      let result;
+      const contentType = toolResponse.headers.get('content-type');
+      console.log(`   Content-Type: ${contentType}`);
+      
+      if (contentType && contentType.includes('application/json')) {
+        const responseText = await toolResponse.text();
+        console.log(`   Raw Response Body (first 2000 chars):`, responseText.substring(0, 2000));
+        try {
+          result = JSON.parse(responseText);
+          console.log(`   Parsed JSON:`, JSON.stringify(result, null, 2).substring(0, 1000));
+        } catch (parseError) {
+          console.error(`   ❌ JSON Parse Error:`, parseError.message);
+          result = { response: responseText, status: toolResponse.status, parseError: parseError.message };
+        }
+      } else {
+        const text = await toolResponse.text();
+        console.log(`   Text Response (first 2000 chars):`, text.substring(0, 2000));
+        result = { response: text, status: toolResponse.status };
+      }
+      
+      if (!toolResponse.ok) {
+        console.error(`   ⚠️  HTTP Error Status: ${toolResponse.status}`);
+      }
+      
+      console.log(`📥 ====================================\n`);
+      
+      console.log('✅ Sending tool response to Gemini');
+      session?.sendToolResponse({
+        functionResponses: [
+          {
+            id: fc.id,
+            name: fc.name,
+            response: { result: JSON.stringify(result) },
+          },
+        ],
+      });
+      
+      console.log(`🔧 ========== TOOL CALL END (SUCCESS) ==========\n`);
+      
+    } catch (error) {
+      console.log(`\n❌ ========== TOOL CALL EXCEPTION ==========`);
+      console.error("❌ Error Type:", error.constructor.name);
+      console.error("❌ Error Message:", error.message);
+      console.error("❌ Error Stack:", error.stack);
+      
+      if (error.cause) {
+        console.error("❌ Error Cause:", error.cause);
+      }
+      
+      if (error.code) {
+        console.error("❌ Error Code:", error.code);
+      }
+      
+      console.log(`❌ ==========================================\n`);
+      
+      session?.sendToolResponse({
+        functionResponses: [
+          {
+            id: fc.id,
+            name: fc.name,
+            response: { result: JSON.stringify({ error: error.message, type: error.constructor.name, details: error.stack }) },
+          },
+        ],
+      });
+      
+      console.log(`🔧 ========== TOOL CALL END (ERROR) ==========\n`);
+    }
+  };
+
   // Initialize Gemini session
   const initializeGeminiSession = async () => {
     try {
@@ -215,16 +442,161 @@ wss.on("connection", (ws, req) => {
       const voiceName = agentConfig.voice?.voiceId || "Kore";
       console.log(`🎤 Initializing Gemini with voice: ${voiceName}`);
 
+      // Parse tool parameters from payload template
       const tools =
-        agentConfig.tools?.map((t) => ({
-          name: t.tool_name,
-          description: t.description || "",
-          parameters: {
-            type: Type.OBJECT,
-            properties: {},
-            required: [],
-          },
-        })) || [];
+        agentConfig.tools?.map((t) => {
+          let params = {};
+          let required = [];
+          
+          if (t.payload_body) {
+            try {
+              // Try to parse as JSON schema first
+              const parsed = JSON.parse(t.payload_body);
+              
+              if (parsed.type === "object" && parsed.properties) {
+                // It's a JSON schema - use it directly
+                console.log(`📋 Using JSON schema for tool: ${t.tool_name}`);
+                
+                // Convert JSON Schema types to Gemini types
+                const convertToGeminiType = (jsonType) => {
+                  const typeMap = {
+                    'string': Type.STRING,
+                    'number': Type.NUMBER,
+                    'integer': Type.INTEGER,
+                    'boolean': Type.BOOLEAN,
+                    'array': Type.ARRAY,
+                    'object': Type.OBJECT
+                  };
+                  return typeMap[jsonType] || Type.STRING;
+                };
+                
+                // Convert properties
+                for (const [propName, propSchema] of Object.entries(parsed.properties)) {
+                  params[propName] = {
+                    type: convertToGeminiType(propSchema.type),
+                    description: propSchema.description || `Parameter: ${propName}`
+                  };
+                  
+                  // Add enum constraints if present
+                  if (propSchema.enum && propSchema.enum.length > 0) {
+                    params[propName].enum = propSchema.enum;
+                    params[propName].description += ` Allowed values: ${propSchema.enum.join(', ')}`;
+                  }
+                  
+                  // Handle array items - include structure for first level
+                  if (propSchema.type === 'array' && propSchema.items) {
+                    params[propName].items = {
+                      type: convertToGeminiType(propSchema.items.type || 'object')
+                    };
+                    
+                    // For object arrays, include first-level properties
+                    if (propSchema.items.type === 'object' && propSchema.items.properties) {
+                      params[propName].items.properties = {};
+                      
+                      for (const [itemPropName, itemPropSchema] of Object.entries(propSchema.items.properties)) {
+                        params[propName].items.properties[itemPropName] = {
+                          type: convertToGeminiType(itemPropSchema.type),
+                          description: itemPropSchema.description || `Parameter: ${itemPropName}`
+                        };
+                        
+                        // Add enum constraints for array item properties
+                        if (itemPropSchema.enum) {
+                          params[propName].items.properties[itemPropName].enum = itemPropSchema.enum;
+                          params[propName].items.properties[itemPropName].description += ` Allowed values: ${itemPropSchema.enum.join(', ')}`;
+                        }
+                        
+                        // For nested arrays (like lineModifierSets), provide structure but not deep nesting
+                        if (itemPropSchema.type === 'array' && itemPropSchema.items) {
+                          params[propName].items.properties[itemPropName].items = {
+                            type: convertToGeminiType(itemPropSchema.items.type || 'object')
+                          };
+                          
+                          // If these array items are objects with properties, list them
+                          if (itemPropSchema.items.properties) {
+                            const nestedFieldNames = Object.keys(itemPropSchema.items.properties);
+                            const nestedRequired = itemPropSchema.items.required || [];
+                            params[propName].items.properties[itemPropName].description = 
+                              `${itemPropSchema.description || ''} Each item must include: ${nestedFieldNames.join(', ')}${nestedRequired.length ? `. Required fields: ${nestedRequired.join(', ')}` : ''}`.trim();
+                          }
+                        }
+                      }
+                      
+                      // Include required fields for array items
+                      if (propSchema.items.required) {
+                        params[propName].items.required = propSchema.items.required;
+                      }
+                    }
+                  }
+                  
+                  // Handle nested objects
+                  if (propSchema.type === 'object' && propSchema.properties) {
+                    params[propName].properties = {};
+                    for (const [nestedName, nestedSchema] of Object.entries(propSchema.properties)) {
+                      params[propName].properties[nestedName] = {
+                        type: convertToGeminiType(nestedSchema.type),
+                        description: nestedSchema.description || `Parameter: ${nestedName}`
+                      };
+                      
+                      // Add enum for nested properties
+                      if (nestedSchema.enum) {
+                        params[propName].properties[nestedName].enum = nestedSchema.enum;
+                        params[propName].properties[nestedName].description += ` Allowed values: ${nestedSchema.enum.join(', ')}`;
+                      }
+                    }
+                    
+                    // Add required fields for nested objects
+                    if (propSchema.required) {
+                      params[propName].required = propSchema.required;
+                    }
+                  }
+                }
+                
+                required = parsed.required || [];
+                
+              } else {
+                // Not a schema, look for {{...}} placeholders
+                console.log(`📋 Using template placeholders for tool: ${t.tool_name}`);
+                const paramMatches = t.payload_body.matchAll(/\{\{(\w+)\}\}/g);
+                for (const match of paramMatches) {
+                  const paramName = match[1];
+                  if (!params[paramName]) {
+                    params[paramName] = {
+                      type: Type.STRING,
+                      description: `Parameter: ${paramName}`
+                    };
+                    required.push(paramName);
+                  }
+                }
+              }
+            } catch (e) {
+              // Failed to parse as JSON, look for {{...}} placeholders
+              console.log(`📋 Using template placeholders for tool: ${t.tool_name} (JSON parse failed)`);
+              const paramMatches = t.payload_body.matchAll(/\{\{(\w+)\}\}/g);
+              for (const match of paramMatches) {
+                const paramName = match[1];
+                if (!params[paramName]) {
+                  params[paramName] = {
+                    type: Type.STRING,
+                    description: `Parameter: ${paramName}`
+                  };
+                  required.push(paramName);
+                }
+              }
+            }
+          }
+          
+          return {
+            name: t.tool_name,
+            description: t.description || `Execute ${t.tool_name}`,
+            parameters: {
+              type: Type.OBJECT,
+              properties: params,
+              required: required,
+            },
+          };
+        }) || [];
+      
+      console.log('🔧 Loaded tools:', tools.map(t => ({ name: t.name, params: Object.keys(t.parameters.properties) })));
 
       const startTime = Date.now();
       geminiSession = await aiClient.live.connect({
@@ -411,71 +783,6 @@ wss.on("connection", (ws, req) => {
   };
 
   // Tool call handler
-  const handleToolCall = async (fc, session) => {
-    console.log(`🔧 Tool called: ${fc.name}`);
-
-    if (!agentConfig?.tools || agentConfig.tools.length === 0) {
-      session?.sendToolResponse({
-        functionResponses: [
-          {
-            id: fc.id,
-            name: fc.name,
-            response: { result: JSON.stringify({ error: "No tools configured" }) },
-          },
-        ],
-      });
-      return;
-    }
-
-    const tool = agentConfig.tools.find((t) => t.tool_name === fc.name);
-    if (!tool) {
-      session?.sendToolResponse({
-        functionResponses: [
-          {
-            id: fc.id,
-            name: fc.name,
-            response: { result: JSON.stringify({ error: "Tool not found" }) },
-          },
-        ],
-      });
-      return;
-    }
-
-    try {
-      const headers = { "Content-Type": "application/json", ...tool.headers };
-      const body = tool.payload_body
-        ? JSON.parse(tool.payload_body.replace(/\\{\\{(\w+)\\}\\}/g, (_, key) => fc.args[key] || ""))
-        : fc.args;
-
-      const toolResponse = await fetch(tool.endpoint_url, {
-        method: tool.http_method,
-        headers,
-        body: tool.http_method !== "GET" ? JSON.stringify(body) : undefined,
-      });
-
-      const result = await toolResponse.json();
-      session?.sendToolResponse({
-        functionResponses: [
-          {
-            id: fc.id,
-            name: fc.name,
-            response: { result: JSON.stringify(result) },
-          },
-        ],
-      });
-    } catch (error) {
-      console.error("❌ Tool execution error:", error.message);
-      session?.sendToolResponse({
-        functionResponses: [
-          {
-            id: fc.id,
-            name: fc.name,
-            response: { result: JSON.stringify({ error: error.message }) },
-          },
-        ],
-      });
-    }
-  };
 
   // Save transcript to database
   const saveTranscript = async () => {
@@ -517,9 +824,6 @@ wss.on("connection", (ws, req) => {
 
   ws.on("message", async (message) => {
     const msg = JSON.parse(message.toString());
-
-    // Log all incoming messages for debugging
-    console.log("📨 Received event:", msg.event, msg.event === "start" ? msg.start : "");
 
     if (msg.event === "start") {
       streamSid = msg.start.streamSid;
@@ -574,12 +878,35 @@ wss.on("connection", (ws, req) => {
 
         agentConfig = agent.config;
         workspaceId = agent.workspace_id;
+        
+        // STEP 5: Validate tools structure loaded from DB
         console.log("✓ Agent config loaded:", {
           agentName: agent.agent_name,
           voice: agentConfig?.voice?.voiceId,
           hasTools: agentConfig?.tools?.length > 0,
+          toolsCount: agentConfig?.tools?.length || 0,
           workspaceId,
         });
+        
+        if (agentConfig?.tools && agentConfig.tools.length > 0) {
+          console.log('🔧 Validating loaded tools...');
+          agentConfig.tools.forEach((tool, idx) => {
+            const isValid = tool.id && tool.tool_name && tool.endpoint_url && tool.http_method;
+            if (!isValid) {
+              console.error(`❌ Invalid tool ${idx}:`, {
+                hasId: !!tool.id,
+                hasName: !!tool.tool_name,
+                hasUrl: !!tool.endpoint_url,
+                hasMethod: !!tool.http_method,
+                tool
+              });
+            } else {
+              console.log(`✅ Tool ${idx} valid:`, tool.tool_name);
+            }
+          });
+        } else {
+          console.log('⚠️ No tools configured for this agent');
+        }
       } catch (error) {
         console.error("❌ Agent load exception:", error.message, error.stack);
         ws.close(1008, "Failed to load agent");
