@@ -94,8 +94,8 @@ function processGeminiToTwilio(geminiChunk) {
 }
 
 // --- Initialize Supabase Client ---
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabaseUrl = "https://kxmmqqcrlpxmqujkaxvv.supabase.co";
+const supabaseKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imt4bW1xcWNybHB4bXF1amtheHZ2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjE1NzI5MDYsImV4cCI6MjA3NzE0ODkwNn0.Dj4PPCoKQz1o2E3XxW4ApXQSVeUfTF5LqBo7F2hcgvk";
 if (!supabaseUrl || !supabaseKey) {
   console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
   console.error("SUPABASE_URL:", supabaseUrl ? "✓ Set" : "✗ Missing");
@@ -124,11 +124,11 @@ let activeConnections = 0;
 // Pre-initialize AI client
 let aiClient = null;
 (async () => {
-  if (!process.env.GEMINI_API_KEY) {
-    console.error("GEMINI_API_KEY not set in environment variables!");
-    process.exit(1);
-  }
-  aiClient = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+  // if (!process.env.GEMINI_API_KEY) {
+  //   console.error("GEMINI_API_KEY not set in environment variables!");
+  //   process.exit(1);
+  // }
+  aiClient = new GoogleGenAI({ apiKey: "AIzaSyD-9yqGaJ8kMgtvZKirBxoeN2nKjLAT69M" });
   console.log("✅ AI client pre-initialized");
 })();
 
@@ -181,6 +181,119 @@ async function startRecording(callSid, accountSid, authToken) {
     }
   } catch (error) {
     console.error("❌ Recording error:", error.message);
+  }
+}
+
+// Post-call analysis function
+async function analyzeCallTranscript(transcript, analysisConfig, callLogId) {
+  if (!analysisConfig?.enabled || !analysisConfig?.fields || analysisConfig.fields.length === 0) {
+    console.log("⏭️ Post-call analysis disabled or no fields configured");
+    return;
+  }
+
+  try {
+    console.log("🔍 Starting post-call analysis for call:", callLogId);
+    console.log("📋 Analysis fields:", analysisConfig.fields.length);
+
+    // Build schema for Gemini tool calling
+    const toolSchema = {
+      type: "object",
+      properties: {},
+      required: []
+    };
+
+    analysisConfig.fields.forEach(field => {
+      const fieldSchema = {};
+      
+      switch (field.type) {
+        case "string":
+          fieldSchema.type = "string";
+          break;
+        case "number":
+          fieldSchema.type = "number";
+          break;
+        case "boolean":
+          fieldSchema.type = "boolean";
+          break;
+        case "enum":
+          fieldSchema.type = "string";
+          if (field.choices && field.choices.length > 0) {
+            fieldSchema.enum = field.choices;
+          }
+          break;
+      }
+      
+      if (field.description) {
+        fieldSchema.description = field.description;
+      }
+      
+      toolSchema.properties[field.name] = fieldSchema;
+      
+      if (field.required) {
+        toolSchema.required.push(field.name);
+      }
+    });
+
+    console.log("📐 Built schema:", JSON.stringify(toolSchema, null, 2));
+
+    // Call Gemini Flash Lite for analysis
+    const analysisPrompt = `Analyze the following call transcript and extract the requested information. Be accurate and concise.\n\nTranscript:\n${transcript}`;
+
+    const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite-latest:generateContent?key=" + process.env.GEMINI_API_KEY, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: analysisPrompt }]
+          }
+        ],
+        tools: [
+          {
+            functionDeclarations: [
+              {
+                name: "extract_call_data",
+                description: "Extract structured data from the call transcript",
+                parameters: toolSchema
+              }
+            ]
+          }
+        ],
+        toolConfig: {
+          functionCallingConfig: {
+            mode: "ANY",
+            allowedFunctionNames: ["extract_call_data"]
+          }
+        }
+      })
+    });
+
+    const result = await response.json();
+    console.log("🤖 Gemini response received");
+
+    // Extract function call result
+    if (result.candidates?.[0]?.content?.parts?.[0]?.functionCall) {
+      const extractedData = result.candidates[0].content.parts[0].functionCall.args;
+      console.log("✅ Extracted data:", extractedData);
+
+      // Save to database
+      const { error: updateError } = await supabase
+        .from("call_logs")
+        .update({ analysis_data: extractedData })
+        .eq("id", callLogId);
+
+      if (updateError) {
+        console.error("❌ Failed to save analysis data:", updateError);
+      } else {
+        console.log("💾 Analysis data saved to database");
+      }
+    } else {
+      console.warn("⚠️ No function call in response:", JSON.stringify(result, null, 2));
+    }
+
+  } catch (error) {
+    console.error("❌ Post-call analysis failed:", error.message, error.stack);
   }
 }
 
@@ -614,7 +727,7 @@ wss.on("connection", (ws, req) => {
           outputAudioTranscription: {},
         },
         callbacks: {
-          onopen: () => {
+          onopen: function() {
             console.log(`✅ Gemini session ready (${Date.now() - startTime}ms)`);
             sessionReady = true;
 
@@ -632,34 +745,49 @@ wss.on("connection", (ws, req) => {
 
             // Handle initial message if configured
             const initialMessage = agentConfig.settings?.initialMessage;
-            if (initialMessage?.enabled && geminiSession) {
-              console.log("🎤 Initial message enabled, type:", initialMessage.type);
+            console.log("🔍 Initial message config:", JSON.stringify(initialMessage, null, 2));
 
+            if (initialMessage?.enabled) {
+              console.log("🎤 Initial message configuration:", {
+                enabled: initialMessage.enabled,
+                type: initialMessage.type,
+                customMessage: initialMessage.customMessage || "(none)"
+              });
+              
+              // Add delay to ensure session is fully initialized
               setTimeout(() => {
-                if (!geminiSession || !sessionReady) return;
-
+                if (!geminiSession) {
+                  console.error("❌ geminiSession not available for initial message");
+                  return;
+                }
+                
                 if (initialMessage.type === "custom" && initialMessage.customMessage) {
                   console.log("📤 Sending custom initial message:", initialMessage.customMessage);
                   geminiSession.sendRealtimeInput({
                     text: initialMessage.customMessage,
                   });
-                  // Send silent audio to trigger response
-                  const silentChunk = Buffer.alloc(480);
+                  
+                  const silentChunk = Buffer.alloc(3840);
                   geminiSession.sendRealtimeInput({
                     media: { data: silentChunk.toString("base64"), mimeType: "audio/pcm;rate=16000" },
                   });
+                  console.log("✅ Custom initial message sent");
+                  
                 } else if (initialMessage.type === "dynamic") {
                   console.log("📤 Triggering dynamic initial message");
                   geminiSession.sendRealtimeInput({
-                    text: "Please greet the user and introduce yourself based on your role.",
+                    text: "Start the conversation now. Begin speaking to the user as instructed in your system prompt.",
                   });
-                  // Send silent audio to trigger response
-                  const silentChunk = Buffer.alloc(480);
+                  
+                  const silentChunk = Buffer.alloc(3840);
                   geminiSession.sendRealtimeInput({
                     media: { data: silentChunk.toString("base64"), mimeType: "audio/pcm;rate=16000" },
                   });
+                  console.log("✅ Dynamic initial message trigger sent");
                 }
               }, 500);
+            } else {
+              console.log("ℹ️ Initial message not enabled");
             }
 
             // Start Gemini keep-alive
@@ -1035,6 +1163,19 @@ wss.on("connection", (ws, req) => {
             transcript: formattedTranscript || null,
           })
           .eq("id", callLogId);
+
+        // Trigger post-call analysis
+        if (formattedTranscript && agentConfig?.settings?.postCallAnalysis) {
+          console.log("🔍 Triggering post-call analysis...");
+          // Run analysis asynchronously (don't block call end)
+          analyzeCallTranscript(
+            formattedTranscript, 
+            agentConfig.settings.postCallAnalysis,
+            callLogId
+          ).catch(err => {
+            console.error("❌ Post-call analysis error:", err);
+          });
+        }
       }
 
       ws.close();
