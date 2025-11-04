@@ -239,7 +239,7 @@ async function analyzeCallTranscript(transcript, analysisConfig, callLogId) {
     // Call Gemini Flash Lite for analysis
     const analysisPrompt = `Analyze the following call transcript and extract the requested information. Be accurate and concise.\n\nTranscript:\n${transcript}`;
 
-    const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite-latest:generateContent?key=" + process.env.GEMINI_API_KEY, {
+    const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=" + process.env.GEMINI_API_KEY, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -764,7 +764,7 @@ wss.on("connection", (ws, req) => {
                 if (initialMessage.type === "custom" && initialMessage.customMessage) {
                   console.log("📤 Sending custom initial message:", initialMessage.customMessage);
                   geminiSession.sendRealtimeInput({
-                    text: initialMessage.customMessage,
+                    text: `Say this exact message to the user: "${initialMessage.customMessage}"`,
                   });
                   
                   const silentChunk = Buffer.alloc(3840);
